@@ -130,9 +130,24 @@ jobs:
         run: |
           KERNEL_VER="${{ github.event.inputs.kernel_version }}"
           if [ -z "$KERNEL_VER" ]; then KERNEL_VER="7.1"; fi
+          KERNEL_BUNDLE_REPO="1venLeung/sheng-linux-build"
+          echo "Downloading kernel-bundle-${KERNEL_VER} from ${KERNEL_BUNDLE_REPO}"
           
           gh release download "kernel-bundle-${KERNEL_VER}" \
-            --pattern "*.deb" --repo "${{ github.repository }}" --clobber || true
+            --pattern "*.deb" --repo "${KERNEL_BUNDLE_REPO}" --clobber
+          ls -lh *.deb
+          for required_deb in \
+            linux-xiaomi-sheng.deb \
+            firmware-xiaomi-sheng.deb \
+            alsa-xiaomi-sheng.deb \
+            sheng-devauth.deb \
+            fastrpc_1.0.2-1_arm64.deb \
+            libssc_0.4.2-1_arm64.deb \
+            iio-sensor-proxy_99993.8-6_arm64.deb \
+            sheng-sensors_20240917-1_arm64.deb
+          do
+            test -f "$required_deb" || { echo "Missing driver package: $required_deb"; exit 1; }
+          done
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -120,11 +120,30 @@ XMODIFIERS=@im=fcitx
 EOF
 
         echo "📦 正在注入设备专属 .deb 驱动包..."
-        wget -q https://github.com/code002-2/Xiaomi-pad-6s-pro-Linux/releases/download/mipps/xiaomi-mipps-auth_0.11_arm64.deb
+        wget -q -O xiaomi-mipps-auth_0.11_arm64.deb https://github.com/code002-2/Xiaomi-pad-6s-pro-Linux/releases/download/mipps/xiaomi-mipps-auth_0.11_arm64.deb
+        ls -lh *.deb
         cp *.deb rootdir/tmp/
+        REQUIRED_DRIVER_PACKAGES=(
+            linux-xiaomi-sheng
+            firmware-xiaomi-sheng
+            alsa-xiaomi-sheng
+            sheng-devauth
+            fastrpc
+            libssc
+            iio-sensor-proxy
+            sheng-sensors
+            xiaomi-mipps-auth
+        )
 
-        chroot rootdir bash -c "export DEBIAN_FRONTEND=noninteractive && apt-get install -y libglib2.0-0 libprotobuf-c1 libqmi-glib5 libmbim-glib4 initramfs-tools"
-        chroot rootdir bash -c "export DEBIAN_FRONTEND=noninteractive && apt-get install -y /tmp/*.deb" || echo "⚠️ 部分 .deb 存在警告，继续执行。"
+        chroot rootdir bash -c "export DEBIAN_FRONTEND=noninteractive && apt-get install -y libglib2.0-0 libprotobuf-c1 libqmi-glib5 libmbim-glib4 initramfs-tools alsa-ucm-conf"
+        chroot rootdir bash -c "export DEBIAN_FRONTEND=noninteractive && apt-get install -y /tmp/*.deb"
+        chroot rootdir bash -c "dpkg --configure -a && apt-get -f install -y"
+        chroot rootdir bash -c "dpkg-query -W -f='\${Package} \${Status}\n' ${REQUIRED_DRIVER_PACKAGES[*]}"
+        for pkg in "${REQUIRED_DRIVER_PACKAGES[@]}"; do
+            chroot rootdir dpkg-query -W -f='${Status}' "$pkg" | grep -q '^install ok installed$'
+            echo "Verified driver package installed: $pkg"
+        done
+        chroot rootdir test -x /usr/bin/xiaomi_devauth
         
         chroot rootdir bash -c "echo 'root:1234' | chpasswd"
         echo "debian-$FLAVOUR-$MODE" > rootdir/etc/hostname
