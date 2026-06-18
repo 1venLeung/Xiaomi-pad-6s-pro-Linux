@@ -19,6 +19,14 @@ echo "📥 正在拉取内核源码..."
 git clone https://github.com/code002-2/sm8550-mainline.git --branch sheng-mainline --depth 1 linux
 cd linux
 
+if compgen -G "../kernel-patches/*.patch" > /dev/null; then
+    echo "Applying local kernel patches..."
+    for patch in ../kernel-patches/*.patch; do
+        echo "Applying $patch"
+        git apply --check "$patch"
+        git apply "$patch"
+    done
+fi
 # ==========================================
 # 3. 智能配置注入 (底座 + 高通专有补丁合并)
 # ==========================================

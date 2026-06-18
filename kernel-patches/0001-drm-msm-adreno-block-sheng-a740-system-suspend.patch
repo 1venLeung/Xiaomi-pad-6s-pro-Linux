@@ -1,0 +1,56 @@
+diff --git a/drivers/gpu/drm/msm/adreno/adreno_device.c b/drivers/gpu/drm/msm/adreno/adreno_device.c
+index fc38331ce..465fdad2e 100644
+--- a/drivers/gpu/drm/msm/adreno/adreno_device.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_device.c
+@@ -8,6 +8,9 @@
+ 
+ #include "adreno_gpu.h"
+ 
++#include <linux/kernel.h>
++#include <linux/of.h>
++
+ bool hang_debug = false;
+ MODULE_PARM_DESC(hang_debug, "Dump registers when hang is detected (can be slow!)");
+ module_param_named(hang_debug, hang_debug, bool, 0600);
+@@ -358,6 +361,31 @@ static void resume_scheduler(struct msm_gpu *gpu)
+ 	}
+ }
+ 
++static bool adreno_block_system_suspend(struct msm_gpu *gpu)
++{
++	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++
++	/*
++	 * Xiaomi Pad 6S Pro (sheng) currently cannot reliably system-suspend
++	 * its Adreno 740/GMU stack.  The observed failure mode is a half-failed
++	 * suspend where the GMU stops responding to OOB GPU_SET requests, KWin
++	 * loses its GL context, and the display is left with only the hardware
++	 * cursor visible.
++	 *
++	 * Keep runtime PM untouched, but reject real system suspend on this
++	 * platform until the A740 GMU suspend/resume sequence is fixed.
++	 */
++	if (system_state == SYSTEM_SUSPEND &&
++	    of_machine_is_compatible("xiaomi,sheng") &&
++	    adreno_is_a740(adreno_gpu)) {
++		dev_warn_once(gpu->dev->dev,
++			      "blocking system suspend: xiaomi,sheng A740 GMU suspend is unstable\n");
++		return true;
++	}
++
++	return false;
++}
++
+ static int adreno_system_suspend(struct device *dev)
+ {
+ 	struct msm_gpu *gpu = dev_to_gpu(dev);
+@@ -366,6 +394,9 @@ static int adreno_system_suspend(struct device *dev)
+ 	if (!gpu)
+ 		return 0;
+ 
++	if (adreno_block_system_suspend(gpu))
++		return -EBUSY;
++
+ 	suspend_scheduler(gpu);
+ 
+ 	remaining = wait_event_timeout(gpu->retire_event,
