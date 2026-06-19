@@ -100,7 +100,28 @@ index bb230449a..6d109a345 100644
  		}
  		mutex_unlock(&nanosic->conn_mutex);
  	}
-@@ -819,6 +858,164 @@ static void nanosic_wn8030_wake_worker(struct work_struct *data)
+@@ -596,6 +635,20 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+ 	case 0x23:
+ 	case 0x24:
+ 		nanosic_wn8030_handle_vendor(nanosic, buf);
++		mod_delayed_work(system_wq, &nanosic->charge_worker,
++				 msecs_to_jiffies(100));
++		break;
++	default:
++		/*
++		 * Charger insertion/removal also raises the WN8030 IRQ, but
++		 * does not necessarily result in a PMIC GLINK or power-supply
++		 * notification while the keyboard is attached.  Use these
++		 * non-HID MCU events as the hardware trigger for the bounded
++		 * charge coordination worker.  Keyboard and touchpad reports
++		 * above deliberately do not enter this path.
++		 */
++		mod_delayed_work(system_wq, &nanosic->charge_worker,
++				 msecs_to_jiffies(100));
+ 		break;
+ 	}
+ 
+@@ -819,6 +872,164 @@ static void nanosic_wn8030_wake_worker(struct work_struct *data)
  	schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
  }
  
