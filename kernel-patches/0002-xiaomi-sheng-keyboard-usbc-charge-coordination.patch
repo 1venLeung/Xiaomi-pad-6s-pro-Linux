@@ -121,7 +121,7 @@ index bb230449a..6d109a345 100644
  		break;
  	}
  
-@@ -819,6 +872,164 @@ static void nanosic_wn8030_wake_worker(struct work_struct *data)
+@@ -819,6 +872,169 @@ static void nanosic_wn8030_wake_worker(struct work_struct *data)
  	schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
  }
  
@@ -249,7 +249,12 @@ index bb230449a..6d109a345 100644
 +	nanosic->charge_power_on = charge_on;
 +	mutex_unlock(&nanosic->conn_mutex);
 +
-+	if (charge_on)
++	/*
++	 * Once the charger is online, subsequent WN8030 status IRQs do not
++	 * require another PMIC/UCSI refresh.  Keep refreshing only while the
++	 * state changed or the initial charger negotiation is incomplete.
++	 */
++	if (charge_on && (!unchanged || !online))
 +		nanosic_wn8030_request_charge_refresh(nanosic, online);
 +	else
 +		nanosic->charge_refresh_retries = 0;
@@ -286,7 +291,7 @@ index bb230449a..6d109a345 100644
  struct nanosic_auth_req {
  	u8 uid[16];
  	u8 challenge[16];
-@@ -946,6 +1143,9 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
+@@ -946,6 +1148,9 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
  	i2c_set_clientdata(client, nanosic);
  
  	INIT_DELAYED_WORK(&nanosic->wake_worker, nanosic_wn8030_wake_worker);
@@ -296,7 +301,7 @@ index bb230449a..6d109a345 100644
  
  	init_waitqueue_head(&nanosic->auth_read_wq);
  	init_completion(&nanosic->auth_token_ready);
-@@ -987,6 +1187,12 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
+@@ -987,6 +1192,12 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
  		goto err_misc;
  	}
  
@@ -309,7 +314,7 @@ index bb230449a..6d109a345 100644
  	return 0;
  
  err_misc:
-@@ -1002,7 +1208,10 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
+@@ -1002,7 +1213,10 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
  	struct nanosic_wn8030 *nanosic = i2c_get_clientdata(client);
  
  	disable_irq(nanosic->client->irq);
@@ -320,7 +325,7 @@ index bb230449a..6d109a345 100644
  
  	misc_deregister(&nanosic->auth_misc);
  
-@@ -1034,6 +1243,14 @@ static int nanosic_wn8030_resume(struct device *dev)
+@@ -1034,6 +1248,14 @@ static int nanosic_wn8030_resume(struct device *dev)
  
  	/* Wake up keyboard after MCU exits sleep */
  	nanosic_wn8030_set_kb_power(nanosic, true);
@@ -335,7 +340,7 @@ index bb230449a..6d109a345 100644
  
  	return 0;
  }
-@@ -1044,6 +1261,8 @@ static int nanosic_wn8030_suspend(struct device *dev)
+@@ -1044,6 +1266,8 @@ static int nanosic_wn8030_suspend(struct device *dev)
  
  	disable_irq(nanosic->client->irq);
  	cancel_delayed_work_sync(&nanosic->wake_worker);
