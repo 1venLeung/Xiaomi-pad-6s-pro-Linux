@@ -1,0 +1,575 @@
+diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
+index c14fb3fc3..e27c2ecd3 100644
+--- a/drivers/hid/Kconfig
++++ b/drivers/hid/Kconfig
+@@ -831,6 +831,8 @@ config HID_MULTITOUCH
+ config HID_NANOSIC_WN8030
+ 	tristate "Nanosic WN8030 keyboard MCU"
+ 	depends on OF && PM && HIDRAW && I2C && GPIOLIB
++	depends on BATTERY_QCOM_BATTMGR
++	depends on UCSI_PMIC_GLINK
+ 	help
+ 	  Say Y here if you want to enable support for the Nanosic WN8030 MCU
+ 	  used as keyboard controller in devices such as Xiaomi Pad 6S Pro 12.4 
+diff --git a/drivers/hid/hid-nanosic-wn8030.c b/drivers/hid/hid-nanosic-wn8030.c
+index bb230449a..6d109a345 100644
+--- a/drivers/hid/hid-nanosic-wn8030.c
++++ b/drivers/hid/hid-nanosic-wn8030.c
+@@ -14,7 +14,11 @@
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/power/qcom_battmgr.h>
++#include <linux/power_supply.h>
+ #include <linux/regmap.h>
++#include <linux/string.h>
++#include <linux/usb/ucsi_glink.h>
+ #include <linux/workqueue.h>
+ 
+ #define WN8030_HEADER_ADDR 0x7FC0
+@@ -23,6 +27,10 @@
+ #define XM_WN8030_I2C_READ (68)
+ #define XM_WN8030_I2C_WRITE (66)
+ 
++#define WN8030_BATTMGR_SYNC_RETRIES 10
++#define WN8030_CHARGE_SYNC_RETRIES 10
++#define WN8030_CHARGE_REFRESH_RETRIES 8
++
+ static const char * const nanosic_wn8030_supply_names[] = {
+ 	"vddio",	/* I/O power supply (1.8V) */
+ 	"dvdd",		/* Digital power supply (3.3V) */
+@@ -42,9 +50,17 @@ struct nanosic_wn8030 {
+ 	struct regmap *regmap;
+ 	struct mutex conn_mutex;
+ 	struct delayed_work wake_worker;
++	struct delayed_work battmgr_sync_worker;
++	struct delayed_work charge_worker;
++	struct notifier_block power_supply_nb;
+ 
+ 	bool suspended;
+ 	bool keyboard_attached;
++	bool charge_power_valid;
++	bool charge_power_on;
++	unsigned int battmgr_sync_retries;
++	unsigned int charge_sync_retries;
++	unsigned int charge_refresh_retries;
+ 
+ 	/* Authentication */
+ 	struct miscdevice auth_misc;
+@@ -364,6 +380,17 @@ static int nanosic_wn8030_set_kb_power(struct nanosic_wn8030 *nanosic, bool enab
+ 	return regmap_bulk_write(nanosic->regmap, 0x5c, buf, sizeof(buf));
+ }
+ 
++static int nanosic_wn8030_set_charge_power(struct nanosic_wn8030 *nanosic, bool enable)
++{
++	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4E, 0x31,
++					0x81, 0x38, 0x42, 0x19 };
++
++	buf[8] = enable;
++	buf[33] = nanosic_wn8030_checksum8(&buf[2], sizeof(buf) - 2);
++
++	return regmap_bulk_write(nanosic->regmap, 0x5c, buf, sizeof(buf));
++}
++
+ static int nanosic_wn8030_xm_auth_init(struct nanosic_wn8030 *nanosic)
+ {
+ 	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4F, 0x31,
+@@ -505,6 +532,12 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
+ 			nanosic_wn8030_add_keyboard_hid(nanosic);
+ 			nanosic_wn8030_add_touchpad_hid(nanosic);
+ 			nanosic->keyboard_attached = true;
++			nanosic->battmgr_sync_retries = 0;
++			nanosic->charge_power_valid = false;
++			nanosic->charge_sync_retries = 0;
++			nanosic->charge_refresh_retries = 0;
++			mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker, 0);
++			mod_delayed_work(system_wq, &nanosic->charge_worker, msecs_to_jiffies(100));
+ 			schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
+ 		} else if (((buf[12] & 0x3) == 0x0) && nanosic->keyboard_attached) {
+ 			cancel_delayed_work_sync(&nanosic->wake_worker);
+@@ -517,6 +550,12 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
+ 				nanosic->hid_touchpad = NULL;
+ 			}
+ 			nanosic->keyboard_attached = false;
++			nanosic->battmgr_sync_retries = 0;
++			nanosic->charge_power_valid = false;
++			nanosic->charge_sync_retries = 0;
++			nanosic->charge_refresh_retries = 0;
++			cancel_delayed_work(&nanosic->charge_worker);
++			mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker, 0);
+ 		}
+ 		mutex_unlock(&nanosic->conn_mutex);
+ 	}
+@@ -819,6 +858,164 @@ static void nanosic_wn8030_wake_worker(struct work_struct *data)
+ 	schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
+ }
+ 
++static void nanosic_wn8030_battmgr_sync_worker(struct work_struct *data)
++{
++	struct nanosic_wn8030 *nanosic =
++		container_of(data, struct nanosic_wn8030, battmgr_sync_worker.work);
++	bool attached;
++	int ret;
++
++	mutex_lock(&nanosic->conn_mutex);
++	attached = nanosic->keyboard_attached;
++	mutex_unlock(&nanosic->conn_mutex);
++
++	ret = qcom_battmgr_xiaomi_set_keyboard_attached(attached);
++	if (ret == -EPROBE_DEFER || ret == -EAGAIN || ret == -ETIMEDOUT) {
++		if (++nanosic->battmgr_sync_retries <= WN8030_BATTMGR_SYNC_RETRIES) {
++			mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker,
++					 msecs_to_jiffies(500));
++			return;
++		}
++	}
++
++	if (ret)
++		dev_warn(nanosic->dev,
++			 "failed to report keyboard %s to charger firmware: %d\n",
++			 attached ? "attached" : "detached", ret);
++	else
++		nanosic->battmgr_sync_retries = 0;
++}
++
++static bool nanosic_wn8030_read_usb_supply_state(const char *name, bool *charge_on,
++						 bool *online)
++{
++	union power_supply_propval val;
++	struct power_supply *psy;
++	bool found = false;
++
++	psy = power_supply_get_by_name(name);
++	if (!psy)
++		return false;
++
++	found = true;
++	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) && val.intval > 0) {
++		*online = true;
++		*charge_on = true;
++	}
++	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val) && val.intval > 0)
++		*charge_on = true;
++
++	power_supply_put(psy);
++
++	return found;
++}
++
++static void nanosic_wn8030_request_charge_refresh(struct nanosic_wn8030 *nanosic,
++						  bool online)
++{
++	int ret;
++
++	ret = qcom_battmgr_xiaomi_set_keyboard_attached(true);
++	if (ret && ret != -EAGAIN && ret != -EPROBE_DEFER && ret != -ETIMEDOUT)
++		dev_warn(nanosic->dev, "failed to refresh keyboard charger state: %d\n", ret);
++
++	ret = pmic_glink_ucsi_xiaomi_connector_refresh();
++	if (ret && ret != -EAGAIN && ret != -EPROBE_DEFER)
++		dev_warn(nanosic->dev, "failed to refresh UCSI connector: %d\n", ret);
++
++	if (!online && nanosic->charge_refresh_retries++ < WN8030_CHARGE_REFRESH_RETRIES)
++		mod_delayed_work(system_wq, &nanosic->charge_worker, msecs_to_jiffies(500));
++	else if (online)
++		nanosic->charge_refresh_retries = 0;
++}
++
++static void nanosic_wn8030_charge_worker(struct work_struct *data)
++{
++	struct nanosic_wn8030 *nanosic =
++		container_of(data, struct nanosic_wn8030, charge_worker.work);
++	bool attached;
++	bool found = false;
++	bool charge_on = false;
++	bool online = false;
++	bool unchanged;
++	int ret;
++
++	mutex_lock(&nanosic->conn_mutex);
++	attached = nanosic->keyboard_attached;
++	mutex_unlock(&nanosic->conn_mutex);
++	if (!attached)
++		return;
++
++	found |= nanosic_wn8030_read_usb_supply_state("qcom-battmgr-usb", &charge_on, &online);
++	found |= nanosic_wn8030_read_usb_supply_state("ucsi-source-psy-pmic_glink.ucsi.01",
++						      &charge_on, &online);
++	if (!found) {
++		if (++nanosic->charge_sync_retries <= WN8030_CHARGE_SYNC_RETRIES) {
++			mod_delayed_work(system_wq, &nanosic->charge_worker, msecs_to_jiffies(500));
++			return;
++		}
++		dev_warn(nanosic->dev, "USB power supplies not ready for charge coordination\n");
++		return;
++	}
++	nanosic->charge_sync_retries = 0;
++
++	mutex_lock(&nanosic->conn_mutex);
++	attached = nanosic->keyboard_attached;
++	unchanged = nanosic->charge_power_valid && nanosic->charge_power_on == charge_on;
++	mutex_unlock(&nanosic->conn_mutex);
++	if (!attached)
++		return;
++
++	if (!unchanged) {
++		ret = nanosic_wn8030_set_charge_power(nanosic, charge_on);
++		if (ret) {
++			dev_warn(nanosic->dev, "failed to %s keyboard charge power: %d\n",
++				 charge_on ? "enable" : "disable", ret);
++			return;
++		}
++		dev_info(nanosic->dev, "keyboard charge power %s\n",
++			 charge_on ? "enabled" : "disabled");
++	}
++
++	mutex_lock(&nanosic->conn_mutex);
++	nanosic->charge_power_valid = true;
++	nanosic->charge_power_on = charge_on;
++	mutex_unlock(&nanosic->conn_mutex);
++
++	if (charge_on)
++		nanosic_wn8030_request_charge_refresh(nanosic, online);
++	else
++		nanosic->charge_refresh_retries = 0;
++}
++
++static bool nanosic_wn8030_is_usb_power_supply(struct power_supply *psy)
++{
++	const char *name;
++
++	if (!psy || !psy->desc || !psy->desc->name)
++		return false;
++
++	name = psy->desc->name;
++
++	return !strcmp(name, "qcom-battmgr-usb") ||
++	       !strncmp(name, "ucsi-source-psy-", strlen("ucsi-source-psy-"));
++}
++
++static int nanosic_wn8030_power_supply_event(struct notifier_block *nb,
++					     unsigned long event, void *ptr)
++{
++	struct nanosic_wn8030 *nanosic =
++		container_of(nb, struct nanosic_wn8030, power_supply_nb);
++	struct power_supply *psy = ptr;
++
++	if (event != PSY_EVENT_PROP_CHANGED || !nanosic_wn8030_is_usb_power_supply(psy))
++		return NOTIFY_OK;
++
++	mod_delayed_work(system_wq, &nanosic->charge_worker, 0);
++
++	return NOTIFY_OK;
++}
++
+ struct nanosic_auth_req {
+ 	u8 uid[16];
+ 	u8 challenge[16];
+@@ -946,6 +1143,9 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
+ 	i2c_set_clientdata(client, nanosic);
+ 
+ 	INIT_DELAYED_WORK(&nanosic->wake_worker, nanosic_wn8030_wake_worker);
++	INIT_DELAYED_WORK(&nanosic->battmgr_sync_worker, nanosic_wn8030_battmgr_sync_worker);
++	INIT_DELAYED_WORK(&nanosic->charge_worker, nanosic_wn8030_charge_worker);
++	nanosic->power_supply_nb.notifier_call = nanosic_wn8030_power_supply_event;
+ 
+ 	init_waitqueue_head(&nanosic->auth_read_wq);
+ 	init_completion(&nanosic->auth_token_ready);
+@@ -987,6 +1187,12 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
+ 		goto err_misc;
+ 	}
+ 
++	ret = power_supply_reg_notifier(&nanosic->power_supply_nb);
++	if (ret) {
++		ret = dev_err_probe(nanosic->dev, ret, "failed to register power supply notifier\n");
++		goto err_misc;
++	}
++
+ 	return 0;
+ 
+ err_misc:
+@@ -1002,7 +1208,10 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
+ 	struct nanosic_wn8030 *nanosic = i2c_get_clientdata(client);
+ 
+ 	disable_irq(nanosic->client->irq);
++	power_supply_unreg_notifier(&nanosic->power_supply_nb);
+ 	cancel_delayed_work_sync(&nanosic->wake_worker);
++	cancel_delayed_work_sync(&nanosic->battmgr_sync_worker);
++	cancel_delayed_work_sync(&nanosic->charge_worker);
+ 
+ 	misc_deregister(&nanosic->auth_misc);
+ 
+@@ -1034,6 +1243,14 @@ static int nanosic_wn8030_resume(struct device *dev)
+ 
+ 	/* Wake up keyboard after MCU exits sleep */
+ 	nanosic_wn8030_set_kb_power(nanosic, true);
++	if (nanosic->keyboard_attached) {
++		nanosic->battmgr_sync_retries = 0;
++		nanosic->charge_power_valid = false;
++		nanosic->charge_sync_retries = 0;
++		nanosic->charge_refresh_retries = 0;
++		mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker, 0);
++		mod_delayed_work(system_wq, &nanosic->charge_worker, msecs_to_jiffies(100));
++	}
+ 
+ 	return 0;
+ }
+@@ -1044,6 +1261,8 @@ static int nanosic_wn8030_suspend(struct device *dev)
+ 
+ 	disable_irq(nanosic->client->irq);
+ 	cancel_delayed_work_sync(&nanosic->wake_worker);
++	cancel_delayed_work_sync(&nanosic->battmgr_sync_worker);
++	cancel_delayed_work_sync(&nanosic->charge_worker);
+ 
+ 	gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
+ 	msleep(10);
+diff --git a/drivers/power/supply/qcom_battmgr.c b/drivers/power/supply/qcom_battmgr.c
+index 911e8cb77..be7b2d121 100644
+--- a/drivers/power/supply/qcom_battmgr.c
++++ b/drivers/power/supply/qcom_battmgr.c
+@@ -10,6 +10,7 @@
+ #include <linux/mutex.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of_device.h>
++#include <linux/power/qcom_battmgr.h>
+ #include <linux/power_supply.h>
+ #include <linux/property.h>
+ #include <linux/soc/qcom/pdr.h>
+@@ -159,6 +160,7 @@ enum qcom_battmgr_variant {
+ #define XM_BATT_SLAVE_AUTHENTIC		0xa5
+ #define XM_BATT_FG2_RM				0xa6
+ #define XM_BATT_FG2_FCC			0xa7
++#define XM_BATT_KEYBOARD_PLUGIN		0xdc
+ #define XM_BATT_PPS_PTF			0xe7
+ 
+ struct qcom_battmgr_enable_request {
+@@ -418,6 +420,9 @@ struct qcom_battmgr {
+ 	struct mutex lock;
+ };
+ 
++static DEFINE_MUTEX(xiaomi_battmgr_lock);
++static struct qcom_battmgr *xiaomi_battmgr;
++
+ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
+ {
+ 	unsigned long left;
+@@ -480,6 +485,32 @@ static int qcom_battmgr_xiaomi_request_property(struct qcom_battmgr *battmgr, in
+ 	return ret;
+ }
+ 
++int qcom_battmgr_xiaomi_set_keyboard_attached(bool attached)
++{
++	struct qcom_battmgr *battmgr;
++	int ret;
++
++	mutex_lock(&xiaomi_battmgr_lock);
++	battmgr = xiaomi_battmgr;
++	if (!battmgr) {
++		ret = -EPROBE_DEFER;
++		goto out_unlock;
++	}
++
++	ret = qcom_battmgr_xiaomi_request_property(battmgr, BATTMGR_XM_PROPERTY_SET,
++						   XM_BATT_KEYBOARD_PLUGIN,
++						   attached, NULL);
++	if (!ret)
++		dev_info(battmgr->dev, "reported keyboard %s to charger firmware\n",
++			 attached ? "attached" : "detached");
++
++out_unlock:
++	mutex_unlock(&xiaomi_battmgr_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(qcom_battmgr_xiaomi_set_keyboard_attached);
++
+ static int qcom_battmgr_xiaomi_update_capacity(struct qcom_battmgr *battmgr)
+ {
+ 	u32 fg1_rm, fg1_fcc, fg2_rm, fg2_fcc;
+@@ -2460,9 +2491,29 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
+ 
+ 	pmic_glink_client_register(battmgr->client);
+ 
++	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
++		mutex_lock(&xiaomi_battmgr_lock);
++		xiaomi_battmgr = battmgr;
++		mutex_unlock(&xiaomi_battmgr_lock);
++	}
++
+ 	return 0;
+ }
+ 
++static void qcom_battmgr_remove(struct auxiliary_device *adev)
++{
++	struct qcom_battmgr *battmgr = dev_get_drvdata(&adev->dev);
++
++	if (battmgr->variant == XIAOMI_BATTMGR_SM8550) {
++		mutex_lock(&xiaomi_battmgr_lock);
++		if (xiaomi_battmgr == battmgr)
++			xiaomi_battmgr = NULL;
++		mutex_unlock(&xiaomi_battmgr_lock);
++	}
++
++	cancel_work_sync(&battmgr->enable_work);
++}
++
+ static const struct auxiliary_device_id qcom_battmgr_id_table[] = {
+ 	{ .name = "pmic_glink.power-supply", },
+ 	{},
+@@ -2472,6 +2523,7 @@ MODULE_DEVICE_TABLE(auxiliary, qcom_battmgr_id_table);
+ static struct auxiliary_driver qcom_battmgr_driver = {
+ 	.name = "pmic_glink_power_supply",
+ 	.probe = qcom_battmgr_probe,
++	.remove = qcom_battmgr_remove,
+ 	.id_table = qcom_battmgr_id_table,
+ };
+ 
+diff --git a/drivers/usb/typec/ucsi/ucsi_glink.c b/drivers/usb/typec/ucsi/ucsi_glink.c
+index 12e07b9fe..4b27acd72 100644
+--- a/drivers/usb/typec/ucsi/ucsi_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_glink.c
+@@ -6,9 +6,11 @@
+ #include <linux/auxiliary_bus.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/property.h>
+ #include <linux/soc/qcom/pdr.h>
++#include <linux/usb/ucsi_glink.h>
+ #include <linux/usb/typec_mux.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/soc/qcom/pmic_glink.h>
+@@ -77,10 +79,14 @@ struct pmic_glink_ucsi {
+ 	spinlock_t state_lock;
+ 	bool ucsi_registered;
+ 	bool pd_running;
++	bool xiaomi_sheng;
+ 
+ 	u8 read_buf[UCSI_BUF_V2_SIZE];
+ };
+ 
++static DEFINE_MUTEX(xiaomi_ucsi_lock);
++static struct pmic_glink_ucsi *xiaomi_ucsi;
++
+ static int pmic_glink_ucsi_read(struct ucsi *__ucsi, unsigned int offset,
+ 				void *val, size_t val_len)
+ {
+@@ -310,6 +316,33 @@ static void pmic_glink_ucsi_notify(struct work_struct *work)
+ 	ucsi_notify_common(ucsi->ucsi, cci);
+ }
+ 
++int pmic_glink_ucsi_xiaomi_connector_refresh(void)
++{
++	struct pmic_glink_ucsi *ucsi;
++	int ret = 0;
++
++	mutex_lock(&xiaomi_ucsi_lock);
++	ucsi = xiaomi_ucsi;
++	if (!ucsi) {
++		ret = -EPROBE_DEFER;
++		goto out_unlock;
++	}
++
++	if (!ucsi->ucsi_registered) {
++		ret = -EAGAIN;
++		goto out_unlock;
++	}
++
++	dev_info(ucsi->dev, "forcing Xiaomi sheng UCSI connector refresh\n");
++	ucsi_connector_change(ucsi->ucsi, 1);
++
++out_unlock:
++	mutex_unlock(&xiaomi_ucsi_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(pmic_glink_ucsi_xiaomi_connector_refresh);
++
+ static void pmic_glink_ucsi_register(struct work_struct *work)
+ {
+ 	struct pmic_glink_ucsi *ucsi = container_of(work, struct pmic_glink_ucsi, register_work);
+@@ -400,6 +433,9 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
+ 
+ 	ucsi->dev = dev;
+ 	dev_set_drvdata(dev, ucsi);
++	ucsi->xiaomi_sheng = dev->parent && dev->parent->of_node &&
++			      of_device_is_compatible(dev->parent->of_node,
++						      "xiaomi,sm8550-pmic-glink");
+ 
+ 	INIT_WORK(&ucsi->notify_work, pmic_glink_ucsi_notify);
+ 	INIT_WORK(&ucsi->register_work, pmic_glink_ucsi_register);
+@@ -460,6 +496,12 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
+ 
+ 	pmic_glink_client_register(ucsi->client);
+ 
++	if (ucsi->xiaomi_sheng) {
++		mutex_lock(&xiaomi_ucsi_lock);
++		xiaomi_ucsi = ucsi;
++		mutex_unlock(&xiaomi_ucsi_lock);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -467,6 +509,13 @@ static void pmic_glink_ucsi_remove(struct auxiliary_device *adev)
+ {
+ 	struct pmic_glink_ucsi *ucsi = dev_get_drvdata(&adev->dev);
+ 
++	if (ucsi->xiaomi_sheng) {
++		mutex_lock(&xiaomi_ucsi_lock);
++		if (xiaomi_ucsi == ucsi)
++			xiaomi_ucsi = NULL;
++		mutex_unlock(&xiaomi_ucsi_lock);
++	}
++
+ 	/* Unregister first to stop having read & writes */
+ 	ucsi_unregister(ucsi->ucsi);
+ }
+diff --git a/include/linux/power/qcom_battmgr.h b/include/linux/power/qcom_battmgr.h
+new file mode 100644
+index 000000000..d9112995d
+--- /dev/null
++++ b/include/linux/power/qcom_battmgr.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_POWER_QCOM_BATTMGR_H
++#define _LINUX_POWER_QCOM_BATTMGR_H
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++#include <linux/types.h>
++
++#if IS_REACHABLE(CONFIG_BATTERY_QCOM_BATTMGR)
++int qcom_battmgr_xiaomi_set_keyboard_attached(bool attached);
++#else
++static inline int qcom_battmgr_xiaomi_set_keyboard_attached(bool attached)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++#endif /* _LINUX_POWER_QCOM_BATTMGR_H */
+diff --git a/include/linux/usb/ucsi_glink.h b/include/linux/usb/ucsi_glink.h
+new file mode 100644
+index 000000000..9ad4a979d
+--- /dev/null
++++ b/include/linux/usb/ucsi_glink.h
+@@ -0,0 +1,17 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_USB_UCSI_GLINK_H
++#define _LINUX_USB_UCSI_GLINK_H
++
++#include <linux/errno.h>
++#include <linux/kconfig.h>
++
++#if IS_REACHABLE(CONFIG_UCSI_PMIC_GLINK)
++int pmic_glink_ucsi_xiaomi_connector_refresh(void);
++#else
++static inline int pmic_glink_ucsi_xiaomi_connector_refresh(void)
++{
++	return -EOPNOTSUPP;
++}
++#endif
++
++#endif /* _LINUX_USB_UCSI_GLINK_H */
