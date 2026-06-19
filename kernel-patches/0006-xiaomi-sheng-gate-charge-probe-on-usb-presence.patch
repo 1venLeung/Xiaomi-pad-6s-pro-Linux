@@ -1,0 +1,99 @@
+diff --git a/drivers/hid/hid-nanosic-wn8030.c b/drivers/hid/hid-nanosic-wn8030.c
+index 210ff4c..643a4c1 100644
+--- a/drivers/hid/hid-nanosic-wn8030.c
++++ b/drivers/hid/hid-nanosic-wn8030.c
+@@ -32,6 +32,7 @@
+ #define WN8030_CHARGE_SYNC_RETRIES 10
+ #define WN8030_CHARGE_REFRESH_RETRIES 8
+ #define WN8030_CHARGE_QUIESCE_MS 600
++#define WN8030_USB_WEAK_PRESENT_UV 100000
+ #define WN8030_USB_PRESENT_UV 1000000
+ #define WN8030_USB_DETACH_PROBE_IGNORE_MS 2500
+ 
+@@ -976,7 +977,7 @@ static void nanosic_wn8030_battmgr_sync_worker(struct work_struct *data)
+ }
+ 
+ static bool nanosic_wn8030_read_usb_supply_state(const char *name, bool *charge_on,
+-						 bool *online)
++						 bool *online, bool *candidate_present)
+ {
+ 	union power_supply_propval val;
+ 	struct power_supply *psy;
+@@ -990,10 +991,14 @@ static bool nanosic_wn8030_read_usb_supply_state(const char *name, bool *charge_
+ 	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) && val.intval > 0) {
+ 		*online = true;
+ 		*charge_on = true;
++		*candidate_present = true;
++	}
++	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val)) {
++		if (val.intval >= WN8030_USB_WEAK_PRESENT_UV)
++			*candidate_present = true;
++		if (val.intval >= WN8030_USB_PRESENT_UV)
++			*charge_on = true;
+ 	}
+-	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val) &&
+-	    val.intval >= WN8030_USB_PRESENT_UV)
+-		*charge_on = true;
+ 
+ 	power_supply_put(psy);
+ 
+@@ -1033,6 +1038,7 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 	bool found = false;
+ 	bool charge_on = false;
+ 	bool online = false;
++	bool candidate_present = false;
+ 	bool target_charge_power = true;
+ 	bool unchanged;
+ 	bool probe_active;
+@@ -1045,9 +1051,10 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 	if (!attached)
+ 		return;
+ 
+-	found |= nanosic_wn8030_read_usb_supply_state("qcom-battmgr-usb", &charge_on, &online);
++	found |= nanosic_wn8030_read_usb_supply_state("qcom-battmgr-usb", &charge_on,
++						      &online, &candidate_present);
+ 	found |= nanosic_wn8030_read_usb_supply_state("ucsi-source-psy-pmic_glink.ucsi.01",
+-						      &charge_on, &online);
++						      &charge_on, &online, &candidate_present);
+ 	if (!found) {
+ 		if (++nanosic->charge_sync_retries <= WN8030_CHARGE_SYNC_RETRIES) {
+ 			mod_delayed_work(system_wq, &nanosic->charge_worker, msecs_to_jiffies(500));
+@@ -1064,7 +1071,13 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 	nanosic->usb_power_present = charge_on;
+ 	attached = nanosic->keyboard_attached;
+ 	probe_active = nanosic->charge_probe_active;
+-	if (probe_active && !online && !nanosic->charge_quiesce_done) {
++	if (probe_active && !online && !candidate_present) {
++		nanosic->charge_probe_active = false;
++		nanosic->charge_quiesce_done = false;
++		nanosic->charge_refresh_retries = 0;
++		probe_active = false;
++	}
++	if (probe_active && !online && candidate_present && !nanosic->charge_quiesce_done) {
+ 		nanosic->charge_quiesce_done = true;
+ 		do_quiesce = true;
+ 	}
+@@ -1099,10 +1112,12 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 
+ 		charge_on = false;
+ 		online = false;
++		candidate_present = false;
+ 		found = false;
+-		found |= nanosic_wn8030_read_usb_supply_state("qcom-battmgr-usb", &charge_on, &online);
++		found |= nanosic_wn8030_read_usb_supply_state("qcom-battmgr-usb", &charge_on,
++							      &online, &candidate_present);
+ 		found |= nanosic_wn8030_read_usb_supply_state("ucsi-source-psy-pmic_glink.ucsi.01",
+-							      &charge_on, &online);
++							      &charge_on, &online, &candidate_present);
+ 		if (!found)
+ 			return;
+ 
+@@ -1141,7 +1156,7 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 	 * require another PMIC/UCSI refresh.  Keep refreshing only while the
+ 	 * state changed or the initial charger negotiation is incomplete.
+ 	 */
+-	if (probe_active && !online)
++	if (probe_active && !online && candidate_present)
+ 		nanosic_wn8030_request_charge_refresh(nanosic, online);
+ 	else if (charge_on && (!unchanged || probe_active))
+ 		nanosic_wn8030_request_charge_refresh(nanosic, online);
