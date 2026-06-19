@@ -1,0 +1,141 @@
+diff --git a/drivers/hid/hid-nanosic-wn8030.c b/drivers/hid/hid-nanosic-wn8030.c
+index d04abd8..3d3bb1a 100644
+--- a/drivers/hid/hid-nanosic-wn8030.c
++++ b/drivers/hid/hid-nanosic-wn8030.c
+@@ -905,39 +905,37 @@ static void nanosic_wn8030_power_off(struct nanosic_wn8030 *nanosic)
+ 	regulator_bulk_disable(ARRAY_SIZE(nanosic_wn8030_supply_names), nanosic->supplies);
+ }
+ 
+-static int nanosic_wn8030_quiesce_for_charge(struct nanosic_wn8030 *nanosic)
++static int nanosic_wn8030_open_charge_detect_window(struct nanosic_wn8030 *nanosic)
+ {
+-	int ret;
+-
+-	dev_info(nanosic->dev, "temporarily quiescing keyboard MCU for charger detection\n");
+-
+-	disable_irq(nanosic->client->irq);
+-	cancel_delayed_work_sync(&nanosic->wake_worker);
++	int ret, restore_ret;
+ 
+-	nanosic_wn8030_power_off(nanosic);
+-	pmic_glink_ucsi_xiaomi_connector_refresh();
+-	msleep(WN8030_CHARGE_QUIESCE_MS);
++	dev_info(nanosic->dev,
++		 "temporarily isolating keyboard charge path while keeping input active\n");
+ 
+-	ret = nanosic_wn8030_power_on(nanosic);
++	ret = qcom_battmgr_xiaomi_set_keyboard_attached(false);
+ 	if (ret)
+-		goto out_enable_irq;
++		dev_warn(nanosic->dev,
++			 "failed to report temporary keyboard detach for charger detection: %d\n",
++			 ret);
+ 
+-	ret = nanosic_wn8030_load_fw(nanosic);
+-	if (ret)
+-		goto out_power_off;
++	restore_ret = pmic_glink_ucsi_xiaomi_connector_refresh();
++	if (restore_ret)
++		dev_warn(nanosic->dev,
++			 "failed to refresh UCSI during charger detection: %d\n",
++			 restore_ret);
++	msleep(WN8030_CHARGE_QUIESCE_MS);
+ 
+-	nanosic->suspended = false;
+-	nanosic_wn8030_set_kb_power(nanosic, true);
+-	schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
++	restore_ret = qcom_battmgr_xiaomi_set_keyboard_attached(true);
++	if (restore_ret)
++		dev_warn(nanosic->dev,
++			 "failed to restore keyboard attach after charger detection: %d\n",
++			 restore_ret);
+ 
+-	enable_irq(nanosic->client->irq);
+-	return 0;
++	pmic_glink_ucsi_xiaomi_connector_refresh();
++	dev_info(nanosic->dev,
++		 "keyboard charge detection window complete; input remained active\n");
+ 
+-out_power_off:
+-	nanosic_wn8030_power_off(nanosic);
+-out_enable_irq:
+-	enable_irq(nanosic->client->irq);
+-	return ret;
++	return ret ?: restore_ret;
+ }
+ 
+ static void nanosic_wn8030_wake_worker(struct work_struct *data)
+@@ -1011,9 +1009,6 @@ static void nanosic_wn8030_request_charge_refresh(struct nanosic_wn8030 *nanosic
+ {
+ 	int ret;
+ 
+-	ret = qcom_battmgr_xiaomi_set_keyboard_attached(true);
+-	if (ret && ret != -EAGAIN && ret != -EPROBE_DEFER && ret != -ETIMEDOUT)
+-		dev_warn(nanosic->dev, "failed to refresh keyboard charger state: %d\n", ret);
+ 
+ 	ret = pmic_glink_ucsi_xiaomi_connector_refresh();
+ 	if (ret && ret != -EAGAIN && ret != -EPROBE_DEFER)
+@@ -1113,9 +1108,9 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 			mutex_unlock(&nanosic->conn_mutex);
+ 		}
+ 
+-		ret = nanosic_wn8030_quiesce_for_charge(nanosic);
++		ret = nanosic_wn8030_open_charge_detect_window(nanosic);
+ 		if (ret)
+-			dev_warn(nanosic->dev, "failed to quiesce keyboard MCU for charger detection: %d\n",
++			dev_warn(nanosic->dev, "failed to open keyboard charge detection window: %d\n",
+ 				 ret);
+ 
+ 		mutex_lock(&nanosic->conn_mutex);
+@@ -1420,6 +1415,8 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
+ static int nanosic_wn8030_resume(struct device *dev)
+ {
+ 	struct nanosic_wn8030 *nanosic = dev_get_drvdata(dev);
++	bool attached;
++	int ret;
+ 
+ 	enable_irq(nanosic->client->irq);
+ 
+@@ -1433,18 +1430,38 @@ static int nanosic_wn8030_resume(struct device *dev)
+ 		gpiod_set_value_cansleep(nanosic->reset_gpio, 0);
+ 		msleep(20);
+ 		nanosic->suspended = false;
+-		return nanosic_wn8030_load_fw(nanosic);
++		ret = nanosic_wn8030_load_fw(nanosic);
++		if (ret)
++			return ret;
+ 	}
+ 
+-	/* Wake up keyboard after MCU exits sleep */
+-	nanosic_wn8030_set_kb_power(nanosic, true);
+-	if (nanosic->keyboard_attached) {
++	/* Restore both input functions even when resume required an MCU reset. */
++	ret = nanosic_wn8030_set_kb_power(nanosic, true);
++	if (ret)
++		dev_warn(dev, "failed to restore keyboard power after resume: %d\n", ret);
++
++	ret = nanosic_wn8030_set_touchpad(nanosic, true);
++	if (ret)
++		dev_warn(dev, "failed to restore touchpad after resume: %d\n", ret);
++
++	mutex_lock(&nanosic->conn_mutex);
++	attached = nanosic->keyboard_attached;
++	if (attached) {
+ 		nanosic->battmgr_sync_retries = 0;
+ 		nanosic->charge_power_valid = false;
+ 		nanosic->charge_probe_active = false;
+ 		nanosic->charge_quiesce_done = false;
+ 		nanosic->charge_sync_retries = 0;
+ 		nanosic->charge_refresh_retries = 0;
++	}
++	mutex_unlock(&nanosic->conn_mutex);
++
++	if (attached) {
++		ret = nanosic_wn8030_set_charge_power(nanosic, true);
++		if (ret)
++			dev_warn(dev, "failed to restore keyboard charge path after resume: %d\n",
++				 ret);
++		schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
+ 		mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker, 0);
+ 		mod_delayed_work(system_wq, &nanosic->charge_worker, msecs_to_jiffies(100));
+ 	}
