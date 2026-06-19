@@ -1,0 +1,29 @@
+﻿diff --git a/drivers/hid/hid-nanosic-wn8030.c b/drivers/hid/hid-nanosic-wn8030.c
+index 9ea068a..9122a76 100644
+--- a/drivers/hid/hid-nanosic-wn8030.c
++++ b/drivers/hid/hid-nanosic-wn8030.c
+@@ -640,6 +640,15 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+ 	case 0x23:
+ 	case 0x24:
+ 		nanosic_wn8030_handle_vendor(nanosic, buf);
++		mutex_lock(&nanosic->conn_mutex);
++		if (nanosic->keyboard_attached && !nanosic->charge_power_on &&
++		    !nanosic->charge_probe_active) {
++			nanosic->charge_probe_active = true;
++			nanosic->charge_quiesce_done = false;
++			nanosic->charge_refresh_retries = 0;
++			dev_info(nanosic->dev, "starting charger probe from WN8030 vendor IRQ\n");
++		}
++		mutex_unlock(&nanosic->conn_mutex);
+ 		mod_delayed_work(system_wq, &nanosic->charge_worker,
+ 				 msecs_to_jiffies(100));
+ 		break;
+@@ -657,6 +666,7 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+ 			nanosic->charge_probe_active = true;
+ 			nanosic->charge_quiesce_done = false;
+ 			nanosic->charge_refresh_retries = 0;
++			dev_info(nanosic->dev, "starting charger probe from WN8030 status IRQ\n");
+ 		}
+ 		mutex_unlock(&nanosic->conn_mutex);
+ 		mod_delayed_work(system_wq, &nanosic->charge_worker,
+
