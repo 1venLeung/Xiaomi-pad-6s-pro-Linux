@@ -54,3 +54,54 @@ index fc38331ce..465fdad2e 100644
  	suspend_scheduler(gpu);
  
  	remaining = wait_event_timeout(gpu->retire_event,
+diff --git a/kernel/power/suspend.c b/kernel/power/suspend.c
+index 57c442686..73b345087 100644
+--- a/kernel/power/suspend.c
++++ b/kernel/power/suspend.c
+@@ -31,6 +31,7 @@
+ #include <linux/compiler.h>
+ #include <linux/moduleparam.h>
+ #include <linux/fs.h>
++#include <linux/of.h>
+ 
+ #include "power.h"
+ 
+@@ -74,6 +75,28 @@ bool pm_suspend_default_s2idle(void)
+ }
+ EXPORT_SYMBOL_GPL(pm_suspend_default_s2idle);
+ 
++static bool pm_suspend_blocked_by_platform_quirk(suspend_state_t state)
++{
++	/*
++	 * Xiaomi Pad 6S Pro (sheng) currently cannot reliably enter system
++	 * suspend with the mainline Adreno 740/GMU stack.  The failure observed
++	 * on this platform leaves the compositor with a lost GL context and the
++	 * display showing only the hardware cursor after resume.
++	 *
++	 * Reject the system suspend request at the PM core entry point.  This is
++	 * intentionally earlier than device callbacks because the GPU may already
++	 * be runtime-suspended or may not receive the callback path consistently.
++	 * Runtime PM and normal shutdown/reboot paths are left untouched.
++	 */
++	if (of_machine_is_compatible("xiaomi,sheng")) {
++		pr_warn_once("blocking system suspend state %s: xiaomi,sheng A740 GMU suspend is unstable\n",
++			     mem_sleep_labels[state]);
++		return true;
++	}
++
++	return false;
++}
++
+ void s2idle_set_ops(const struct platform_s2idle_ops *ops)
+ {
+ 	unsigned int sleep_flags;
+@@ -640,6 +663,9 @@ int pm_suspend(suspend_state_t state)
+ 	if (state <= PM_SUSPEND_ON || state >= PM_SUSPEND_MAX)
+ 		return -EINVAL;
+ 
++	if (pm_suspend_blocked_by_platform_quirk(state))
++		return -EBUSY;
++
+ 	pr_info("suspend entry (%s)\n", mem_sleep_labels[state]);
+ 	error = enter_state(state);
+ 	dpm_save_errno(error);
