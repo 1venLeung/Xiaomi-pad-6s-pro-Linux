@@ -1,0 +1,485 @@
+diff --git a/drivers/hid/hid-nanosic-wn8030.c b/drivers/hid/hid-nanosic-wn8030.c
+index bb23044..550512d 100644
+--- a/drivers/hid/hid-nanosic-wn8030.c
++++ b/drivers/hid/hid-nanosic-wn8030.c
+@@ -14,7 +14,11 @@
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/power/qcom_battmgr.h>
++#include <linux/power_supply.h>
+ #include <linux/regmap.h>
++#include <linux/string.h>
++#include <linux/usb/ucsi_glink.h>
+ #include <linux/workqueue.h>
+ 
+ #define WN8030_HEADER_ADDR 0x7FC0
+@@ -23,6 +27,12 @@
+ #define XM_WN8030_I2C_READ (68)
+ #define XM_WN8030_I2C_WRITE (66)
+ 
++#define WN8030_BATTMGR_SYNC_RETRIES 10
++#define WN8030_CHARGE_SLEEP_MS 500
++#define WN8030_CHARGE_RESET_MS 500
++#define WN8030_CHARGE_QUIESCE_MS 600
++#define WN8030_USB_WEAK_PRESENT_UV 100000
++
+ static const char * const nanosic_wn8030_supply_names[] = {
+ 	"vddio",	/* I/O power supply (1.8V) */
+ 	"dvdd",		/* Digital power supply (3.3V) */
+@@ -42,9 +52,16 @@ struct nanosic_wn8030 {
+ 	struct regmap *regmap;
+ 	struct mutex conn_mutex;
+ 	struct delayed_work wake_worker;
++	struct delayed_work battmgr_sync_worker;
++	struct delayed_work charge_worker;
++	struct notifier_block power_supply_nb;
+ 
+ 	bool suspended;
+ 	bool keyboard_attached;
++	bool charge_power_valid;
++	bool charge_power_on;
++	bool charge_attempted;
++	unsigned int battmgr_sync_retries;
+ 
+ 	/* Authentication */
+ 	struct miscdevice auth_misc;
+@@ -364,6 +381,17 @@ static int nanosic_wn8030_set_kb_power(struct nanosic_wn8030 *nanosic, bool enab
+ 	return regmap_bulk_write(nanosic->regmap, 0x5c, buf, sizeof(buf));
+ }
+ 
++static int nanosic_wn8030_set_charge_power(struct nanosic_wn8030 *nanosic, bool enable)
++{
++	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4E, 0x31,
++					0x81, 0x38, 0x42, 0x19 };
++
++	buf[8] = enable;
++	buf[33] = nanosic_wn8030_checksum8(&buf[2], sizeof(buf) - 2);
++
++	return regmap_bulk_write(nanosic->regmap, 0x5c, buf, sizeof(buf));
++}
++
+ static int nanosic_wn8030_xm_auth_init(struct nanosic_wn8030 *nanosic)
+ {
+ 	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4F, 0x31,
+@@ -505,6 +533,11 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
+ 			nanosic_wn8030_add_keyboard_hid(nanosic);
+ 			nanosic_wn8030_add_touchpad_hid(nanosic);
+ 			nanosic->keyboard_attached = true;
++			nanosic->battmgr_sync_retries = 0;
++			nanosic->charge_power_valid = false;
++			nanosic->charge_attempted = false;
++			mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker, 0);
++			mod_delayed_work(system_wq, &nanosic->charge_worker, msecs_to_jiffies(100));
+ 			schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
+ 		} else if (((buf[12] & 0x3) == 0x0) && nanosic->keyboard_attached) {
+ 			cancel_delayed_work_sync(&nanosic->wake_worker);
+@@ -517,6 +550,11 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
+ 				nanosic->hid_touchpad = NULL;
+ 			}
+ 			nanosic->keyboard_attached = false;
++			nanosic->battmgr_sync_retries = 0;
++			nanosic->charge_power_valid = false;
++			nanosic->charge_attempted = false;
++			cancel_delayed_work(&nanosic->charge_worker);
++			mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker, 0);
+ 		}
+ 		mutex_unlock(&nanosic->conn_mutex);
+ 	}
+@@ -554,6 +592,19 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
+ 	}
+ }
+ 
++static void nanosic_wn8030_schedule_charge_check(struct nanosic_wn8030 *nanosic)
++{
++	bool attached;
++
++	mutex_lock(&nanosic->conn_mutex);
++	attached = nanosic->keyboard_attached;
++	mutex_unlock(&nanosic->conn_mutex);
++
++	if (attached)
++		mod_delayed_work(system_wq, &nanosic->charge_worker,
++				 msecs_to_jiffies(50));
++}
++
+ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+ {
+ 	int ret;
+@@ -593,6 +644,18 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+ 	case 0x23:
+ 	case 0x24:
+ 		nanosic_wn8030_handle_vendor(nanosic, buf);
++		nanosic_wn8030_schedule_charge_check(nanosic);
++		break;
++	default:
++		/*
++		 * Charger insertion/removal also raises the WN8030 IRQ, but
++		 * does not necessarily result in a PMIC GLINK or power-supply
++		 * notification while the keyboard is attached.  Use these
++		 * non-HID MCU events as the hardware trigger for the bounded
++		 * charge coordination worker.  Keyboard and touchpad reports
++		 * above deliberately do not enter this path.
++		 */
++		nanosic_wn8030_schedule_charge_check(nanosic);
+ 		break;
+ 	}
+ 
+@@ -819,6 +882,263 @@ static void nanosic_wn8030_wake_worker(struct work_struct *data)
+ 	schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
+ }
+ 
++static void nanosic_wn8030_battmgr_sync_worker(struct work_struct *data)
++{
++	struct nanosic_wn8030 *nanosic =
++		container_of(data, struct nanosic_wn8030, battmgr_sync_worker.work);
++	bool attached;
++	int ret;
++
++	mutex_lock(&nanosic->conn_mutex);
++	attached = nanosic->keyboard_attached;
++	mutex_unlock(&nanosic->conn_mutex);
++
++	ret = qcom_battmgr_xiaomi_set_keyboard_attached(attached);
++	if (ret == -EPROBE_DEFER || ret == -EAGAIN || ret == -ETIMEDOUT) {
++		if (++nanosic->battmgr_sync_retries <= WN8030_BATTMGR_SYNC_RETRIES) {
++			mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker,
++					 msecs_to_jiffies(500));
++			return;
++		}
++	}
++
++	if (ret)
++		dev_warn(nanosic->dev,
++			 "failed to report keyboard %s to charger firmware: %d\n",
++			 attached ? "attached" : "detached", ret);
++	else
++		nanosic->battmgr_sync_retries = 0;
++}
++
++static bool nanosic_wn8030_read_usb_supply_state(const char *name, bool *online,
++						 bool *candidate_present)
++{
++	union power_supply_propval val;
++	struct power_supply *psy;
++	bool found = false;
++
++	psy = power_supply_get_by_name(name);
++	if (!psy)
++		return false;
++
++	found = true;
++	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) && val.intval > 0) {
++		*online = true;
++		*candidate_present = true;
++	}
++	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val) &&
++	    val.intval >= WN8030_USB_WEAK_PRESENT_UV)
++		*candidate_present = true;
++
++	power_supply_put(psy);
++
++	return found;
++}
++
++static bool nanosic_wn8030_read_usb_state(bool *online, bool *candidate_present)
++{
++	bool found = false;
++
++	*online = false;
++	*candidate_present = false;
++	found |= nanosic_wn8030_read_usb_supply_state("qcom-battmgr-usb", online,
++						      candidate_present);
++	found |= nanosic_wn8030_read_usb_supply_state("ucsi-source-psy-pmic_glink.ucsi.01",
++						      online, candidate_present);
++
++	return found;
++}
++
++static void nanosic_wn8030_restore_input(struct nanosic_wn8030 *nanosic)
++{
++	int ret;
++
++	ret = nanosic_wn8030_set_kb_power(nanosic, true);
++	if (ret)
++		dev_warn(nanosic->dev, "failed to restore keyboard after charge detection: %d\n",
++			 ret);
++	ret = nanosic_wn8030_set_touchpad(nanosic, true);
++	if (ret)
++		dev_warn(nanosic->dev, "failed to restore touchpad after charge detection: %d\n",
++			 ret);
++}
++
++static bool nanosic_wn8030_refresh_and_wait(unsigned int delay_ms)
++{
++	bool online, candidate_present;
++
++	pmic_glink_ucsi_xiaomi_connector_refresh();
++	msleep(delay_ms);
++	nanosic_wn8030_read_usb_state(&online, &candidate_present);
++
++	return online;
++}
++
++static bool nanosic_wn8030_detect_charge_once(struct nanosic_wn8030 *nanosic)
++{
++	bool online = false;
++	int ret;
++
++	dev_info(nanosic->dev, "starting one-shot charger detection\n");
++
++	/*
++	 * First release only the MCU sleep state. Regulators, firmware and HID
++	 * devices stay intact, so this is the least disruptive detection window.
++	 */
++	disable_irq(nanosic->client->irq);
++	gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
++	online = nanosic_wn8030_refresh_and_wait(WN8030_CHARGE_SLEEP_MS);
++	gpiod_set_value_cansleep(nanosic->sleep_gpio, 0);
++	msleep(25);
++	nanosic->suspended = false;
++	enable_irq(nanosic->client->irq);
++	nanosic_wn8030_restore_input(nanosic);
++	if (online) {
++		dev_info(nanosic->dev, "charger detected after WN8030 sleep window\n");
++		return true;
++	}
++
++	/*
++	 * If sleep was insufficient, assert reset while keeping both regulators
++	 * enabled. Firmware is reloaded only once before escalating further.
++	 */
++	disable_irq(nanosic->client->irq);
++	gpiod_set_value_cansleep(nanosic->reset_gpio, 1);
++	online = nanosic_wn8030_refresh_and_wait(WN8030_CHARGE_RESET_MS);
++	gpiod_set_value_cansleep(nanosic->reset_gpio, 0);
++	msleep(20);
++	ret = nanosic_wn8030_load_fw(nanosic);
++	nanosic->suspended = false;
++	enable_irq(nanosic->client->irq);
++	if (ret)
++		dev_warn(nanosic->dev, "failed to reload WN8030 after reset window: %d\n", ret);
++	else
++		nanosic_wn8030_restore_input(nanosic);
++	if (online) {
++		dev_info(nanosic->dev, "charger detected after WN8030 reset window\n");
++		return true;
++	}
++
++	/*
++	 * Last resort: the v7-proven complete power release. This can briefly
++	 * interrupt input, but it is allowed at most once for a physical attach.
++	 */
++	disable_irq(nanosic->client->irq);
++	cancel_delayed_work_sync(&nanosic->wake_worker);
++	nanosic_wn8030_power_off(nanosic);
++	online = nanosic_wn8030_refresh_and_wait(WN8030_CHARGE_QUIESCE_MS);
++	ret = nanosic_wn8030_power_on(nanosic);
++	if (!ret)
++		ret = nanosic_wn8030_load_fw(nanosic);
++	nanosic->suspended = false;
++	enable_irq(nanosic->client->irq);
++	if (ret)
++		dev_warn(nanosic->dev, "failed to restore WN8030 after full charge window: %d\n",
++			 ret);
++	else {
++		nanosic_wn8030_restore_input(nanosic);
++		schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
++	}
++
++	if (!online)
++		online = nanosic_wn8030_refresh_and_wait(500);
++	if (online)
++		dev_info(nanosic->dev, "charger detected after full WN8030 power window\n");
++	else
++		dev_warn(nanosic->dev,
++			 "one-shot charger detection failed; locked until physical USB detach\n");
++
++	return online;
++}
++
++static void nanosic_wn8030_set_charge_path(struct nanosic_wn8030 *nanosic, bool enable)
++{
++	int ret;
++
++	mutex_lock(&nanosic->conn_mutex);
++	if (nanosic->charge_power_valid && nanosic->charge_power_on == enable) {
++		mutex_unlock(&nanosic->conn_mutex);
++		return;
++	}
++	mutex_unlock(&nanosic->conn_mutex);
++
++	ret = nanosic_wn8030_set_charge_power(nanosic, enable);
++	if (ret) {
++		dev_warn(nanosic->dev, "failed to %s keyboard charge power: %d\n",
++			 enable ? "enable" : "disable", ret);
++		return;
++	}
++	mutex_lock(&nanosic->conn_mutex);
++	nanosic->charge_power_valid = true;
++	nanosic->charge_power_on = enable;
++	mutex_unlock(&nanosic->conn_mutex);
++	dev_info(nanosic->dev, "keyboard charge power %s\n", enable ? "enabled" : "disabled");
++}
++
++static void nanosic_wn8030_charge_worker(struct work_struct *data)
++{
++	struct nanosic_wn8030 *nanosic =
++		container_of(data, struct nanosic_wn8030, charge_worker.work);
++	bool attached, attempted;
++	bool online, candidate_present;
++
++	if (!nanosic_wn8030_read_usb_state(&online, &candidate_present))
++		return;
++
++	mutex_lock(&nanosic->conn_mutex);
++	attached = nanosic->keyboard_attached;
++	attempted = nanosic->charge_attempted;
++	if (!online && !candidate_present && attempted) {
++		nanosic->charge_attempted = false;
++		attempted = false;
++		dev_info(nanosic->dev, "USB detached; charger detection rearmed\n");
++	}
++	if (attached && candidate_present && !online && !attempted)
++		nanosic->charge_attempted = true;
++	if (online)
++		nanosic->charge_attempted = true;
++	mutex_unlock(&nanosic->conn_mutex);
++
++	if (!attached)
++		return;
++
++	nanosic_wn8030_set_charge_path(nanosic, true);
++
++	if (candidate_present && !online && !attempted) {
++		nanosic_wn8030_set_charge_path(nanosic, false);
++		nanosic_wn8030_detect_charge_once(nanosic);
++		nanosic_wn8030_set_charge_path(nanosic, true);
++	}
++}
++
++static bool nanosic_wn8030_is_usb_power_supply(struct power_supply *psy)
++{
++	const char *name;
++
++	if (!psy || !psy->desc || !psy->desc->name)
++		return false;
++
++	name = psy->desc->name;
++
++	return !strcmp(name, "qcom-battmgr-usb") ||
++	       !strncmp(name, "ucsi-source-psy-", strlen("ucsi-source-psy-"));
++}
++
++static int nanosic_wn8030_power_supply_event(struct notifier_block *nb,
++					     unsigned long event, void *ptr)
++{
++	struct nanosic_wn8030 *nanosic =
++		container_of(nb, struct nanosic_wn8030, power_supply_nb);
++	struct power_supply *psy = ptr;
++
++	if (event != PSY_EVENT_PROP_CHANGED || !nanosic_wn8030_is_usb_power_supply(psy))
++		return NOTIFY_OK;
++
++	mod_delayed_work(system_wq, &nanosic->charge_worker, 0);
++
++	return NOTIFY_OK;
++}
++
+ struct nanosic_auth_req {
+ 	u8 uid[16];
+ 	u8 challenge[16];
+@@ -946,6 +1266,9 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
+ 	i2c_set_clientdata(client, nanosic);
+ 
+ 	INIT_DELAYED_WORK(&nanosic->wake_worker, nanosic_wn8030_wake_worker);
++	INIT_DELAYED_WORK(&nanosic->battmgr_sync_worker, nanosic_wn8030_battmgr_sync_worker);
++	INIT_DELAYED_WORK(&nanosic->charge_worker, nanosic_wn8030_charge_worker);
++	nanosic->power_supply_nb.notifier_call = nanosic_wn8030_power_supply_event;
+ 
+ 	init_waitqueue_head(&nanosic->auth_read_wq);
+ 	init_completion(&nanosic->auth_token_ready);
+@@ -987,6 +1310,12 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
+ 		goto err_misc;
+ 	}
+ 
++	ret = power_supply_reg_notifier(&nanosic->power_supply_nb);
++	if (ret) {
++		ret = dev_err_probe(nanosic->dev, ret, "failed to register power supply notifier\n");
++		goto err_misc;
++	}
++
+ 	return 0;
+ 
+ err_misc:
+@@ -1002,7 +1331,10 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
+ 	struct nanosic_wn8030 *nanosic = i2c_get_clientdata(client);
+ 
+ 	disable_irq(nanosic->client->irq);
++	power_supply_unreg_notifier(&nanosic->power_supply_nb);
+ 	cancel_delayed_work_sync(&nanosic->wake_worker);
++	cancel_delayed_work_sync(&nanosic->battmgr_sync_worker);
++	cancel_delayed_work_sync(&nanosic->charge_worker);
+ 
+ 	misc_deregister(&nanosic->auth_misc);
+ 
+@@ -1016,6 +1348,8 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
+ static int nanosic_wn8030_resume(struct device *dev)
+ {
+ 	struct nanosic_wn8030 *nanosic = dev_get_drvdata(dev);
++	bool attached;
++	int ret;
+ 
+ 	enable_irq(nanosic->client->irq);
+ 
+@@ -1029,11 +1363,38 @@ static int nanosic_wn8030_resume(struct device *dev)
+ 		gpiod_set_value_cansleep(nanosic->reset_gpio, 0);
+ 		msleep(20);
+ 		nanosic->suspended = false;
+-		return nanosic_wn8030_load_fw(nanosic);
++		ret = nanosic_wn8030_load_fw(nanosic);
++		if (ret)
++			return ret;
+ 	}
+ 
+-	/* Wake up keyboard after MCU exits sleep */
+-	nanosic_wn8030_set_kb_power(nanosic, true);
++	/* Restore both input functions even when resume required an MCU reset. */
++	ret = nanosic_wn8030_set_kb_power(nanosic, true);
++	if (ret)
++		dev_warn(dev, "failed to restore keyboard power after resume: %d\n", ret);
++
++	ret = nanosic_wn8030_set_touchpad(nanosic, true);
++	if (ret)
++		dev_warn(dev, "failed to restore touchpad after resume: %d\n", ret);
++
++	mutex_lock(&nanosic->conn_mutex);
++	attached = nanosic->keyboard_attached;
++	if (attached) {
++		nanosic->battmgr_sync_retries = 0;
++		nanosic->charge_power_valid = false;
++		nanosic->charge_attempted = false;
++	}
++	mutex_unlock(&nanosic->conn_mutex);
++
++	if (attached) {
++		ret = nanosic_wn8030_set_charge_power(nanosic, true);
++		if (ret)
++			dev_warn(dev, "failed to restore keyboard charge path after resume: %d\n",
++				 ret);
++		schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
++		mod_delayed_work(system_wq, &nanosic->battmgr_sync_worker, 0);
++		mod_delayed_work(system_wq, &nanosic->charge_worker, msecs_to_jiffies(100));
++	}
+ 
+ 	return 0;
+ }
+@@ -1044,6 +1405,8 @@ static int nanosic_wn8030_suspend(struct device *dev)
+ 
+ 	disable_irq(nanosic->client->irq);
+ 	cancel_delayed_work_sync(&nanosic->wake_worker);
++	cancel_delayed_work_sync(&nanosic->battmgr_sync_worker);
++	cancel_delayed_work_sync(&nanosic->charge_worker);
+ 
+ 	gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
+ 	msleep(10);
