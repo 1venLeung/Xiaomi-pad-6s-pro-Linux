@@ -1,12 +1,6 @@
 name: Build Kernel
 
 on:
-  push:
-    branches:
-      - codex/sheng-a740-suspend-guard
-    paths:
-      - ".github/workflows/kernel.yml"
-      - "kernel-patches/**"
   workflow_dispatch:
     inputs:
       kernel_version:
