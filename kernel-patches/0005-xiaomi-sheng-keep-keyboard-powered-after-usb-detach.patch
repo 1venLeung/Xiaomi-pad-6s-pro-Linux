@@ -1,0 +1,197 @@
+diff --git a/drivers/hid/hid-nanosic-wn8030.c b/drivers/hid/hid-nanosic-wn8030.c
+index 9122a76..210ff4c 100644
+--- a/drivers/hid/hid-nanosic-wn8030.c
++++ b/drivers/hid/hid-nanosic-wn8030.c
+@@ -10,6 +10,7 @@
+ #include <linux/hid.h>
+ #include <linux/i2c.h>
+ #include <linux/interrupt.h>
++#include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/miscdevice.h>
+ #include <linux/module.h>
+@@ -32,6 +33,7 @@
+ #define WN8030_CHARGE_REFRESH_RETRIES 8
+ #define WN8030_CHARGE_QUIESCE_MS 600
+ #define WN8030_USB_PRESENT_UV 1000000
++#define WN8030_USB_DETACH_PROBE_IGNORE_MS 2500
+ 
+ static const char * const nanosic_wn8030_supply_names[] = {
+ 	"vddio",	/* I/O power supply (1.8V) */
+@@ -62,6 +64,8 @@ struct nanosic_wn8030 {
+ 	bool charge_power_on;
+ 	bool charge_probe_active;
+ 	bool charge_quiesce_done;
++	bool usb_power_present;
++	unsigned long last_usb_detach_jiffies;
+ 	unsigned int battmgr_sync_retries;
+ 	unsigned int charge_sync_retries;
+ 	unsigned int charge_refresh_retries;
+@@ -601,11 +605,37 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic, u8 *buf
+ 	}
+ }
+ 
++static void nanosic_wn8030_start_charge_probe(struct nanosic_wn8030 *nanosic,
++					      const char *source)
++{
++	bool start = false;
++	bool ignore_detach;
++
++	mutex_lock(&nanosic->conn_mutex);
++	ignore_detach = nanosic->last_usb_detach_jiffies &&
++		time_before(jiffies, nanosic->last_usb_detach_jiffies +
++			    msecs_to_jiffies(WN8030_USB_DETACH_PROBE_IGNORE_MS));
++	if (nanosic->keyboard_attached && !nanosic->charge_probe_active &&
++	    !ignore_detach) {
++		nanosic->charge_probe_active = true;
++		nanosic->charge_quiesce_done = false;
++		nanosic->charge_refresh_retries = 0;
++		start = true;
++		dev_info(nanosic->dev, "starting charger probe from %s\n", source);
++	}
++	mutex_unlock(&nanosic->conn_mutex);
++
++	if (start)
++		mod_delayed_work(system_wq, &nanosic->charge_worker,
++				 msecs_to_jiffies(100));
++}
++
+ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+ {
+ 	int ret;
+ 	struct nanosic_wn8030 *nanosic = data;
+ 	u8 buf[XM_WN8030_I2C_READ];
++	bool was_attached;
+ 
+ 	/* After sleep pin deactivated, fw will trigger irq to notify about
+ 	 * successful resume, second irq will tell about kb connection state
+@@ -639,18 +669,12 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+ 	case 0x22:
+ 	case 0x23:
+ 	case 0x24:
+-		nanosic_wn8030_handle_vendor(nanosic, buf);
+ 		mutex_lock(&nanosic->conn_mutex);
+-		if (nanosic->keyboard_attached && !nanosic->charge_power_on &&
+-		    !nanosic->charge_probe_active) {
+-			nanosic->charge_probe_active = true;
+-			nanosic->charge_quiesce_done = false;
+-			nanosic->charge_refresh_retries = 0;
+-			dev_info(nanosic->dev, "starting charger probe from WN8030 vendor IRQ\n");
+-		}
++		was_attached = nanosic->keyboard_attached;
+ 		mutex_unlock(&nanosic->conn_mutex);
+-		mod_delayed_work(system_wq, &nanosic->charge_worker,
+-				 msecs_to_jiffies(100));
++		nanosic_wn8030_handle_vendor(nanosic, buf);
++		if (was_attached)
++			nanosic_wn8030_start_charge_probe(nanosic, "WN8030 vendor IRQ");
+ 		break;
+ 	default:
+ 		/*
+@@ -661,16 +685,7 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+ 		 * charge coordination worker.  Keyboard and touchpad reports
+ 		 * above deliberately do not enter this path.
+ 		 */
+-		mutex_lock(&nanosic->conn_mutex);
+-		if (nanosic->keyboard_attached && !nanosic->charge_probe_active) {
+-			nanosic->charge_probe_active = true;
+-			nanosic->charge_quiesce_done = false;
+-			nanosic->charge_refresh_retries = 0;
+-			dev_info(nanosic->dev, "starting charger probe from WN8030 status IRQ\n");
+-		}
+-		mutex_unlock(&nanosic->conn_mutex);
+-		mod_delayed_work(system_wq, &nanosic->charge_worker,
+-				 msecs_to_jiffies(100));
++		nanosic_wn8030_start_charge_probe(nanosic, "WN8030 status IRQ");
+ 		break;
+ 	}
+ 
+@@ -1018,6 +1033,7 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 	bool found = false;
+ 	bool charge_on = false;
+ 	bool online = false;
++	bool target_charge_power = true;
+ 	bool unchanged;
+ 	bool probe_active;
+ 	bool do_quiesce = false;
+@@ -1043,6 +1059,9 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 	nanosic->charge_sync_retries = 0;
+ 
+ 	mutex_lock(&nanosic->conn_mutex);
++	if (nanosic->usb_power_present && !charge_on)
++		nanosic->last_usb_detach_jiffies = jiffies;
++	nanosic->usb_power_present = charge_on;
+ 	attached = nanosic->keyboard_attached;
+ 	probe_active = nanosic->charge_probe_active;
+ 	if (probe_active && !online && !nanosic->charge_quiesce_done) {
+@@ -1055,6 +1074,20 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 		return;
+ 
+ 	if (do_quiesce) {
++		ret = nanosic_wn8030_set_charge_power(nanosic, false);
++		if (ret)
++			dev_warn(nanosic->dev,
++				 "failed to disable keyboard charge power for charger detection: %d\n",
++				 ret);
++		else {
++			dev_info(nanosic->dev,
++				 "keyboard charge power disabled for charger detection\n");
++			mutex_lock(&nanosic->conn_mutex);
++			nanosic->charge_power_valid = true;
++			nanosic->charge_power_on = false;
++			mutex_unlock(&nanosic->conn_mutex);
++		}
++
+ 		ret = nanosic_wn8030_quiesce_for_charge(nanosic);
+ 		if (ret)
+ 			dev_warn(nanosic->dev, "failed to quiesce keyboard MCU for charger detection: %d\n",
+@@ -1072,26 +1105,33 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 							      &charge_on, &online);
+ 		if (!found)
+ 			return;
++
++		mutex_lock(&nanosic->conn_mutex);
++		if (nanosic->usb_power_present && !charge_on)
++			nanosic->last_usb_detach_jiffies = jiffies;
++		nanosic->usb_power_present = charge_on;
++		mutex_unlock(&nanosic->conn_mutex);
+ 	}
+ 
+ 	mutex_lock(&nanosic->conn_mutex);
+-	unchanged = nanosic->charge_power_valid && nanosic->charge_power_on == charge_on;
++	unchanged = nanosic->charge_power_valid &&
++		    nanosic->charge_power_on == target_charge_power;
+ 	mutex_unlock(&nanosic->conn_mutex);
+ 
+ 	if (!unchanged) {
+-		ret = nanosic_wn8030_set_charge_power(nanosic, charge_on);
++		ret = nanosic_wn8030_set_charge_power(nanosic, target_charge_power);
+ 		if (ret) {
+ 			dev_warn(nanosic->dev, "failed to %s keyboard charge power: %d\n",
+-				 charge_on ? "enable" : "disable", ret);
++				 target_charge_power ? "enable" : "disable", ret);
+ 			return;
+ 		}
+ 		dev_info(nanosic->dev, "keyboard charge power %s\n",
+-			 charge_on ? "enabled" : "disabled");
++			 target_charge_power ? "enabled" : "disabled");
+ 	}
+ 
+ 	mutex_lock(&nanosic->conn_mutex);
+ 	nanosic->charge_power_valid = true;
+-	nanosic->charge_power_on = charge_on;
++	nanosic->charge_power_on = target_charge_power;
+ 	if (online)
+ 		nanosic->charge_probe_active = false;
+ 	mutex_unlock(&nanosic->conn_mutex);
+@@ -1101,7 +1141,9 @@ static void nanosic_wn8030_charge_worker(struct work_struct *data)
+ 	 * require another PMIC/UCSI refresh.  Keep refreshing only while the
+ 	 * state changed or the initial charger negotiation is incomplete.
+ 	 */
+-	if (charge_on && (!unchanged || probe_active))
++	if (probe_active && !online)
++		nanosic_wn8030_request_charge_refresh(nanosic, online);
++	else if (charge_on && (!unchanged || probe_active))
+ 		nanosic_wn8030_request_charge_refresh(nanosic, online);
+ 	else {
+ 		nanosic->charge_refresh_retries = 0;
