@@ -110,7 +110,7 @@ index fc38331ce..465fdad2e 100644
  
  	remaining = wait_event_timeout(gpu->retire_event,
 diff --git a/kernel/power/suspend.c b/kernel/power/suspend.c
-index 57c442686..1e4b86490 100644
+index 57c442686..7fe4f16c8 100644
 --- a/kernel/power/suspend.c
 +++ b/kernel/power/suspend.c
 @@ -31,6 +31,7 @@
@@ -128,7 +128,7 @@ index 57c442686..1e4b86490 100644
 -
  enum s2idle_states __read_mostly s2idle_state;
  static DEFINE_RAW_SPINLOCK(s2idle_lock);
-+static bool sheng_block_system_suspend = true;
++static bool sheng_block_system_suspend = false;
 +core_param(sheng_block_system_suspend, sheng_block_system_suspend, bool, 0644);
  
  /**
